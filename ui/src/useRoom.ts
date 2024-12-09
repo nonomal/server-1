@@ -1,4 +1,6 @@
+import {useSnackbar} from 'notistack';
 import React from 'react';
+
 import {
     ICEServer,
     IncomingMessage,
@@ -6,11 +8,12 @@ import {
     OutgoingMessage,
     RoomCreate,
     RoomInfo,
+    UIConfig,
 } from './message';
-import {getPermanentName} from './name';
+import {loadSettings, resolveCodecPlaceholder} from './settings';
 import {urlWithSlash} from './url';
-import {useSnackbar} from 'notistack';
-import {useRoomID} from './useRoomID';
+import {authModeToRoomMode} from './useConfig';
+import {getFromURL, useRoomID} from './useRoomID';
 
 export type RoomState = false | ConnectedRoom;
 export type ConnectedRoom = {
@@ -71,6 +74,36 @@ const hostSession = async ({
 
     stream.getTracks().forEach((track) => peer.addTrack(track, stream));
 
+    const preferCodec = resolveCodecPlaceholder(loadSettings().preferCodec);
+    if (preferCodec) {
+        const transceiver = peer
+            .getTransceivers()
+            .find((t) => t.sender && t.sender.track === stream.getVideoTracks()[0]);
+
+        if (!!transceiver && 'setCodecPreferences' in transceiver) {
+            const exactMatch: RTCRtpCodec[] = [];
+            const mimeMatch: RTCRtpCodec[] = [];
+            const others: RTCRtpCodec[] = [];
+
+            RTCRtpSender.getCapabilities('video')?.codecs.forEach((codec) => {
+                if (codec.mimeType === preferCodec.mimeType) {
+                    if (codec.sdpFmtpLine === preferCodec.sdpFmtpLine) {
+                        exactMatch.push(codec);
+                    } else {
+                        mimeMatch.push(codec);
+                    }
+                } else {
+                    others.push(codec);
+                }
+            });
+
+            const sortedCodecs = [...exactMatch, ...mimeMatch, ...others];
+
+            console.log('Setting codec preferences', sortedCodecs);
+            transceiver.setCodecPreferences(sortedCodecs);
+        }
+    }
+
     const hostOffer = await peer.createOffer({offerToReceiveVideo: true});
     await peer.setLocalDescription(hostOffer);
     send({type: 'hostoffer', payload: {value: hostOffer, sid: sid}});
@@ -121,7 +154,7 @@ const clientSession = async ({
 
 export type FCreateRoom = (room: RoomCreate | JoinRoom) => Promise<void>;
 
-export const useRoom = (): UseRoom => {
+export const useRoom = (config: UIConfig): UseRoom => {
     const [roomID, setRoomID] = useRoomID();
     const {enqueueSnackbar} = useSnackbar();
     const conn = React.useRef<WebSocket>();
@@ -147,9 +180,6 @@ export const useRoom = (): UseRoom => {
                         first = false;
                         if (event.type === 'room') {
                             resolve();
-                            enqueueSnackbar(create.type === 'join' ? 'Joined' : 'Room Created', {
-                                variant: 'success',
-                            });
                             setState({ws, ...event.payload, clientStreams: []});
                             setRoomID(event.payload.id);
                         } else {
@@ -230,9 +260,8 @@ export const useRoom = (): UseRoom => {
                                 await client.current[event.payload.sid]?.setRemoteDescription(
                                     event.payload.value
                                 );
-                                const answer = await client.current[
-                                    event.payload.sid
-                                ]?.createAnswer();
+                                const answer =
+                                    await client.current[event.payload.sid]?.createAnswer();
                                 await client.current[event.payload.sid]?.setLocalDescription(
                                     answer
                                 );
@@ -273,11 +302,11 @@ export const useRoom = (): UseRoom => {
                         resolve();
                         first = false;
                     }
-                    enqueueSnackbar(err, {variant: 'error', persist: true});
+                    enqueueSnackbar(err?.toString(), {variant: 'error', persist: true});
                     setState(false);
                 };
                 ws.onopen = () => {
-                    create.payload.username = getPermanentName();
+                    create.payload.username = loadSettings().name;
                     send(create);
                 };
             });
@@ -288,17 +317,31 @@ export const useRoom = (): UseRoom => {
     const share = async () => {
         if (!navigator.mediaDevices) {
             enqueueSnackbar(
-                'Could not start presentation. (mediaDevices undefined) Are you using https?',
-                {
-                    variant: 'error',
-                    persist: true,
-                }
+                'Could not start presentation. Are you using https? (mediaDevices undefined)',
+                {variant: 'error', persist: true}
             );
             return;
         }
-        stream.current = await navigator.mediaDevices
-            // @ts-ignore
-            .getDisplayMedia({video: true});
+        if (typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+            enqueueSnackbar(
+                `Could not start presentation. Your browser likely doesn't support screensharing. (mediaDevices.getDeviceMedia ${typeof navigator.mediaDevices.getDisplayMedia})`,
+                {variant: 'error', persist: true}
+            );
+            return;
+        }
+        try {
+            stream.current = await navigator.mediaDevices.getDisplayMedia({
+                video: {frameRate: loadSettings().framerate},
+            });
+        } catch (e) {
+            console.log('Could not getDisplayMedia', e);
+            enqueueSnackbar(`Could not start presentation. (getDisplayMedia error). ${e}`, {
+                variant: 'error',
+                persist: true,
+            });
+            return;
+        }
+
         stream.current?.getVideoTracks()[0].addEventListener('ended', () => stopShare());
         setState((current) => (current ? {...current, hostStream: stream.current} : current));
 
@@ -322,7 +365,25 @@ export const useRoom = (): UseRoom => {
 
     React.useEffect(() => {
         if (roomID) {
-            room({type: 'join', payload: {id: roomID}});
+            const create = getFromURL('create') === 'true';
+            if (create) {
+                const closeOnOwnerLeaveString = getFromURL('closeOnOwnerLeave');
+                const closeOnOwnerLeave =
+                    closeOnOwnerLeaveString === undefined
+                        ? config.closeRoomWhenOwnerLeaves
+                        : closeOnOwnerLeaveString === 'true';
+                room({
+                    type: 'create',
+                    payload: {
+                        joinIfExist: true,
+                        closeOnOwnerLeave,
+                        id: roomID,
+                        mode: authModeToRoomMode(config.authMode, config.loggedIn),
+                    },
+                });
+            } else {
+                room({type: 'join', payload: {id: roomID}});
+            }
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
